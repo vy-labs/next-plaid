@@ -502,8 +502,23 @@ fn build_router(state: Arc<AppState>) -> Router {
         .merge(api_router)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Configure Tokio runtime with limited blocking threads to prevent rayon over-subscription.
+    // Each spawn_blocking task spawns rayon work that uses all CPU cores, so we limit
+    // concurrent blocking tasks to match expected concurrency (4-8).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4) // Async worker threads (for I/O, not CPU-bound work)
+        .max_blocking_threads(8) // Limit concurrent spawn_blocking tasks to prevent rayon contention
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        main_async().await
+    });
+}
+
+async fn main_async() {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(

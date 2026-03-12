@@ -2,6 +2,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::time::Instant;
 
 use ndarray::Array1;
 use ndarray::{Array2, ArrayView2};
@@ -306,7 +307,106 @@ fn approximate_score_sparse(
     score
 }
 
-/// Compute approximate scores for mmap index using code lookups.
+/// Transpose query-centroid scores from [num_tokens × num_centroids] (row-major)
+/// to [num_centroids × num_tokens] (flat Vec), using parallel chunks.
+///
+/// This makes each centroid's score vector contiguous (128 × 4 = 512 bytes = 8 cache lines),
+/// enabling sequential reads and SIMD auto-vectorization during approximate scoring.
+///
+/// Parallelized with Rayon: each thread transposes a chunk of centroids.
+fn transpose_centroid_scores(query_centroid_scores: &Array2<f32>) -> Vec<f32> {
+    let num_tokens = query_centroid_scores.nrows();
+    let num_centroids = query_centroid_scores.ncols();
+    let src = query_centroid_scores.as_slice().unwrap();
+    let mut dst = vec![0.0f32; num_centroids * num_tokens];
+
+    // Parallel transpose: split centroids into chunks, each thread writes to its own
+    // non-overlapping region of dst. Each centroid c writes to dst[c*num_tokens..(c+1)*num_tokens].
+    const CHUNK: usize = 1024;
+    dst.par_chunks_mut(CHUNK * num_tokens)
+        .enumerate()
+        .for_each(|(chunk_idx, dst_chunk)| {
+            let c_start = chunk_idx * CHUNK;
+            let c_end = (c_start + CHUNK).min(num_centroids);
+            for c in c_start..c_end {
+                let dst_offset = (c - c_start) * num_tokens;
+                for q in 0..num_tokens {
+                    dst_chunk[dst_offset + q] = src[q * num_centroids + c];
+                }
+            }
+        });
+
+    dst
+}
+
+/// Cache-friendly approximate scoring using transposed centroid layout.
+///
+/// Produces **identical results** to the original per-query-token MaxSim scoring,
+/// but with dramatically better cache behavior:
+///
+/// - Original: 128 random lookups per code into a 32MB row-major matrix (L3-bound)
+/// - Transposed: 1 sequential 512-byte read per code (L2-friendly, SIMD-vectorizable)
+///
+/// Uses slice-based `zip` iterators (not raw pointers) so LLVM can prove no-aliasing
+/// and auto-vectorize the inner loop to `vmaxps` (AVX2) or `vmaxps zmm` (AVX-512).
+/// Software prefetching hides L3 latency for the next centroid's scores.
+#[inline]
+fn approximate_score_transposed(transposed: &[f32], num_tokens: usize, doc_codes: &[u32]) -> f32 {
+    // Stack-allocate max buffer — 256 × 4 = 1KB, always fits on stack.
+    debug_assert!(num_tokens <= 256);
+    let mut max_scores = [f32::NEG_INFINITY; 256];
+    let max_buf = &mut max_scores[..num_tokens];
+
+    for (idx, &code) in doc_codes.iter().enumerate() {
+        // Software prefetch: start loading the NEXT code's centroid scores from L3
+        // while we process the current one. L3 latency (~10-15ns × 8 cache lines = ~100ns)
+        // is fully hidden behind the ~16-32ns of SIMD max computation for current code.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Prefetch 2 codes ahead (L3 latency ≈ 2× per-code compute time)
+            if idx + 2 < doc_codes.len() {
+                let pf_code = doc_codes[idx + 2] as usize;
+                let pf_offset = pf_code * num_tokens;
+                if pf_offset + num_tokens <= transposed.len() {
+                    unsafe {
+                        let pf_ptr = transposed.as_ptr().add(pf_offset) as *const i8;
+                        // Prefetch first 4 cache lines (256 bytes) — covers half of 128 floats
+                        std::arch::x86_64::_mm_prefetch(pf_ptr, std::arch::x86_64::_MM_HINT_T0);
+                        std::arch::x86_64::_mm_prefetch(pf_ptr.add(64), std::arch::x86_64::_MM_HINT_T0);
+                        std::arch::x86_64::_mm_prefetch(pf_ptr.add(128), std::arch::x86_64::_MM_HINT_T0);
+                        std::arch::x86_64::_mm_prefetch(pf_ptr.add(192), std::arch::x86_64::_MM_HINT_T0);
+                    }
+                }
+            }
+        }
+
+        let offset = code as usize * num_tokens;
+        // Slice access: compiler knows centroid_scores and max_buf cannot alias
+        // (one is from `transposed: &[f32]`, the other from a local stack array).
+        // This enables LLVM to auto-vectorize the zip loop to vmaxps (AVX2/AVX512).
+        let centroid_scores = &transposed[offset..offset + num_tokens];
+
+        // Zip iterator: LLVM eliminates bounds checks and emits tight SIMD loop.
+        // With AVX2: 8 floats/cycle → 128 floats in 16 iterations.
+        // With AVX-512: 16 floats/cycle → 128 floats in 8 iterations.
+        for (m, &s) in max_buf.iter_mut().zip(centroid_scores.iter()) {
+            // f32::max maps to vmaxps — no branch, pure SIMD.
+            *m = m.max(s);
+        }
+    }
+
+    // Sum all max scores (also auto-vectorizes)
+    let mut score = 0.0f32;
+    for &m in max_buf.iter() {
+        if m > f32::NEG_INFINITY {
+            score += m;
+        }
+    }
+    score
+}
+
+/// Legacy approximate scoring with i64 codes (kept for mmap-only fallback paths).
+#[allow(dead_code)]
 fn approximate_score_mmap(query_centroid_scores: &Array2<f32>, doc_codes: &[i64]) -> f32 {
     let mut score = 0.0;
 
@@ -346,8 +446,12 @@ pub fn search_one_mmap(
         return search_one_mmap_batched(index, query, params, subset);
     }
 
+    let t_total = Instant::now();
+
     // Standard path: compute full query-centroid scores upfront
+    let t0 = Instant::now();
     let query_centroid_scores = query.dot(&index.codec.centroids_view().t());
+    let centroid_dot_ms = t0.elapsed().as_millis();
 
     // When subset is provided, pre-compute eligible centroids: only those containing
     // at least one embedding from a subset document. Centroids without subset docs
@@ -357,9 +461,7 @@ pub fn search_one_mmap(
         for &doc_id in subset_docs {
             let doc_idx = doc_id as usize;
             if doc_idx < index.doc_lengths.len() {
-                let start = index.doc_offsets[doc_idx];
-                let end = index.doc_offsets[doc_idx + 1];
-                let codes = index.mmap_codes.slice(start, end);
+                let codes = index.get_compact_codes(doc_idx);
                 for &c in codes.iter() {
                     centroids.insert(c as usize);
                 }
@@ -386,6 +488,7 @@ pub fn search_one_mmap(
         _ => params.n_ivf_probe,
     };
 
+    let t0 = Instant::now();
     // Find top IVF cells to probe using per-token top-k selection.
     // When pre-filtering, only score eligible centroids (same selection logic,
     // smaller pool). This can only improve recall for subset docs since
@@ -441,6 +544,8 @@ pub fn search_one_mmap(
         let subset_set: HashSet<i64> = subset_docs.iter().copied().collect();
         candidates.retain(|&c| subset_set.contains(&c));
     }
+    let ivf_probe_ms = t0.elapsed().as_millis();
+    let num_candidates = candidates.len();
 
     if candidates.is_empty() {
         return Ok(QueryResult {
@@ -450,29 +555,45 @@ pub fn search_one_mmap(
         });
     }
 
-    // Compute approximate scores
+    // Transpose [128 × 65K] → [65K × 128] for cache-friendly approximate scoring.
+    // Each centroid's 128 scores become contiguous (512 bytes = 8 cache lines).
+    let t0 = Instant::now();
+    let transposed = transpose_centroid_scores(&query_centroid_scores);
+    let transpose_ms = t0.elapsed().as_millis();
+
+    // Approximate scoring: identical MaxSim computation but cache-friendly.
+    // Uses SIMD-friendly slice ops + software prefetching for the transposed layout.
+    let t0 = Instant::now();
     let mut approx_scores: Vec<(i64, f32)> = candidates
         .par_iter()
         .map(|&doc_id| {
-            let start = index.doc_offsets[doc_id as usize];
-            let end = index.doc_offsets[doc_id as usize + 1];
-            let codes = index.mmap_codes.slice(start, end);
-            let score = approximate_score_mmap(&query_centroid_scores, &codes);
+            let codes = index.get_compact_codes(doc_id as usize);
+            let score = approximate_score_transposed(&transposed, num_query_tokens, codes);
             (doc_id, score)
         })
         .collect();
 
-    // Sort by approximate score and take top candidates
+    // Partial sort: O(N) selection of top n_full_scores instead of O(N log N) full sort.
+    // Only need the top n_full_scores candidates — no need to sort ALL 600K.
+    // select_nth_unstable partitions so elements before k are all >= element at k.
+    let k = params.n_full_scores.min(approx_scores.len());
+    if k > 0 && k < approx_scores.len() {
+        approx_scores.select_nth_unstable_by(k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        approx_scores.truncate(k);
+    }
+    // Sort only the small top-k set (3000 elements — microseconds, not milliseconds)
     approx_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    let top_candidates: Vec<i64> = approx_scores
-        .iter()
-        .take(params.n_full_scores)
-        .map(|(id, _)| *id)
-        .collect();
+    let approx_score_ms = t0.elapsed().as_millis();
 
     // Further reduce for full decompression
     let n_decompress = (params.n_full_scores / 4).max(params.top_k);
-    let to_decompress: Vec<i64> = top_candidates.into_iter().take(n_decompress).collect();
+    let to_decompress: Vec<i64> = approx_scores
+        .iter()
+        .take(n_decompress)
+        .map(|(id, _)| *id)
+        .collect();
 
     if to_decompress.is_empty() {
         return Ok(QueryResult {
@@ -484,6 +605,8 @@ pub fn search_one_mmap(
 
     // Compute exact scores with decompressed embeddings
     // Use chunked processing to limit concurrent memory from parallel decompression
+    let n_exact = to_decompress.len();
+    let t0 = Instant::now();
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
@@ -500,6 +623,14 @@ pub fn search_one_mmap(
 
     // Sort by exact score
     exact_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let exact_score_ms = t0.elapsed().as_millis();
+
+    let total_ms = t_total.elapsed().as_millis();
+    eprintln!(
+        "[search_one_mmap] total={}ms | centroid_dot={}ms ivf_probe={}ms (candidates={}) transpose={}ms approx_score={}ms exact_score={}ms (n={})",
+        total_ms, centroid_dot_ms, ivf_probe_ms, num_candidates,
+        transpose_ms, approx_score_ms, exact_score_ms, n_exact
+    );
 
     // Return top-k results
     let result_count = params.top_k.min(exact_scores.len());
@@ -530,9 +661,11 @@ fn search_one_mmap_batched(
     params: &SearchParameters,
     subset: Option<&[i64]>,
 ) -> Result<QueryResult> {
-    let num_query_tokens = query.nrows();
+    let t_total = Instant::now();
+    let _num_query_tokens = query.nrows();
 
     // Step 1: Batched IVF probing
+    let t0 = Instant::now();
     let cells_to_probe = ivf_probe_batched(
         query,
         &index.codec.centroids,
@@ -549,6 +682,8 @@ fn search_one_mmap_batched(
         let subset_set: HashSet<i64> = subset_docs.iter().copied().collect();
         candidates.retain(|&c| subset_set.contains(&c));
     }
+    let ivf_probe_ms = t0.elapsed().as_millis();
+    let num_candidates = candidates.len();
 
     if candidates.is_empty() {
         return Ok(QueryResult {
@@ -558,45 +693,42 @@ fn search_one_mmap_batched(
         });
     }
 
-    // Step 3: Collect unique centroids from all candidate documents
-    let mut unique_centroids: HashSet<usize> = HashSet::new();
-    for &doc_id in &candidates {
-        let start = index.doc_offsets[doc_id as usize];
-        let end = index.doc_offsets[doc_id as usize + 1];
-        let codes = index.mmap_codes.slice(start, end);
-        for &code in codes.iter() {
-            unique_centroids.insert(code as usize);
-        }
-    }
+    // Step 3: Build centroid scores and transpose for cache-friendly access
+    let num_query_tokens = query.nrows();
+    let t0 = Instant::now();
+    let query_centroid_scores = query.dot(&index.codec.centroids.view().t());
+    let transposed = transpose_centroid_scores(&query_centroid_scores);
+    let transpose_ms = t0.elapsed().as_millis();
 
-    // Step 4: Build sparse centroid scores
-    let sparse_scores =
-        build_sparse_centroid_scores(query, &index.codec.centroids, &unique_centroids);
-
-    // Step 5: Compute approximate scores using sparse lookup
+    // Step 4: Approximate scoring with transposed layout (identical results, cache-friendly)
+    let t0 = Instant::now();
     let mut approx_scores: Vec<(i64, f32)> = candidates
         .par_iter()
         .map(|&doc_id| {
-            let start = index.doc_offsets[doc_id as usize];
-            let end = index.doc_offsets[doc_id as usize + 1];
-            let codes = index.mmap_codes.slice(start, end);
-            let doc_codes: Vec<usize> = codes.iter().map(|&c| c as usize).collect();
-            let score = approximate_score_sparse(&sparse_scores, &doc_codes, num_query_tokens);
+            let codes = index.get_compact_codes(doc_id as usize);
+            let score = approximate_score_transposed(&transposed, num_query_tokens, codes);
             (doc_id, score)
         })
         .collect();
 
-    // Sort by approximate score and take top candidates
+    // Partial sort: O(N) selection of top n_full_scores instead of O(N log N) full sort.
+    let k = params.n_full_scores.min(approx_scores.len());
+    if k > 0 && k < approx_scores.len() {
+        approx_scores.select_nth_unstable_by(k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        approx_scores.truncate(k);
+    }
     approx_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    let top_candidates: Vec<i64> = approx_scores
-        .iter()
-        .take(params.n_full_scores)
-        .map(|(id, _)| *id)
-        .collect();
+    let approx_score_ms = t0.elapsed().as_millis();
 
     // Further reduce for full decompression
     let n_decompress = (params.n_full_scores / 4).max(params.top_k);
-    let to_decompress: Vec<i64> = top_candidates.into_iter().take(n_decompress).collect();
+    let to_decompress: Vec<i64> = approx_scores
+        .iter()
+        .take(n_decompress)
+        .map(|(id, _)| *id)
+        .collect();
 
     if to_decompress.is_empty() {
         return Ok(QueryResult {
@@ -608,6 +740,8 @@ fn search_one_mmap_batched(
 
     // Compute exact scores with decompressed embeddings
     // Use chunked processing to limit concurrent memory from parallel decompression
+    let n_exact = to_decompress.len();
+    let t0 = Instant::now();
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
@@ -624,6 +758,14 @@ fn search_one_mmap_batched(
 
     // Sort by exact score
     exact_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let exact_score_ms = t0.elapsed().as_millis();
+
+    let total_ms = t_total.elapsed().as_millis();
+    eprintln!(
+        "[search_one_mmap_batched] total={}ms | ivf_probe={}ms (candidates={}) transpose={}ms approx_score={}ms exact_score={}ms (n={})",
+        total_ms, ivf_probe_ms, num_candidates,
+        transpose_ms, approx_score_ms, exact_score_ms, n_exact
+    );
 
     // Return top-k results
     let result_count = params.top_k.min(exact_scores.len());

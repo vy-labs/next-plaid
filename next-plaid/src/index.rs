@@ -588,6 +588,10 @@ pub struct MmapIndex {
     pub mmap_codes: crate::mmap::MmapNpyArray1I64,
     /// Memory-mapped residuals array (public for search access)
     pub mmap_residuals: crate::mmap::MmapNpyArray2U8,
+    /// Compact codes array: centroid IDs as u32 (0-4B) for fast approximate scoring.
+    /// Supports up to 4 billion centroids (production uses 131K).
+    /// Stored in RAM (4 bytes per code vs 8 bytes in mmap) for 2x less memory bandwidth.
+    pub compact_codes: Vec<u32>,
 }
 
 impl MmapIndex {
@@ -695,6 +699,27 @@ impl MmapIndex {
         let mmap_codes = crate::mmap::MmapNpyArray1I64::from_npy_file(&merged_codes_path)?;
         let mmap_residuals = crate::mmap::MmapNpyArray2U8::from_npy_file(&merged_residuals_path)?;
 
+        // Build compact u32 codes array for fast approximate scoring.
+        // Codes are centroid IDs (0..num_centroids), which fit in u32.
+        // Supports up to 4B centroids (production uses 131K).
+        // This uses 4 bytes per code instead of 8, giving 2x better cache/bandwidth.
+        let total_codes = mmap_codes.len();
+        eprintln!(
+            "Building compact codes array: {} codes ({:.1} GB mmap -> {:.1} GB RAM)...",
+            total_codes,
+            total_codes as f64 * 8.0 / 1e9,
+            total_codes as f64 * 4.0 / 1e9
+        );
+        let start_time = std::time::Instant::now();
+        let mut compact_codes = Vec::with_capacity(total_codes);
+        for i in 0..total_codes {
+            compact_codes.push(mmap_codes.get(i) as u32);
+        }
+        eprintln!(
+            "Compact codes built in {:.1}s",
+            start_time.elapsed().as_secs_f64()
+        );
+
         Ok(Self {
             path: index_path.to_string(),
             metadata,
@@ -706,7 +731,17 @@ impl MmapIndex {
             doc_offsets,
             mmap_codes,
             mmap_residuals,
+            compact_codes,
         })
+    }
+
+    /// Get compact (u32) codes for a document by ID.
+    /// Returns a slice into the in-RAM compact_codes array — zero allocation.
+    #[inline]
+    pub fn get_compact_codes(&self, doc_id: usize) -> &[u32] {
+        let start = self.doc_offsets[doc_id];
+        let end = self.doc_offsets[doc_id + 1];
+        &self.compact_codes[start..end]
     }
 
     /// Get candidate documents from IVF for given centroid indices.

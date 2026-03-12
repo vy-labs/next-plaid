@@ -820,6 +820,31 @@ impl MmapNpyArray1I64 {
         result
     }
 
+    /// Get a zero-copy slice reference directly from the memory-mapped data.
+    ///
+    /// This avoids allocation and copying, but requires that:
+    /// 1. The data is 8-byte aligned (NPY format guarantees this)
+    /// 2. The platform is little-endian (x86/x86_64)
+    ///
+    /// # Safety
+    /// - The caller must ensure start <= end <= len
+    /// - The returned slice is only valid while `self` is alive
+    /// - Only use on little-endian platforms (x86/x86_64)
+    #[allow(dead_code)]
+    pub unsafe fn slice_ref(&self, start: usize, end: usize) -> &[i64] {
+        let byte_start = self.data_offset + start * 8;
+        let byte_end = self.data_offset + end * 8;
+        let bytes = &self._mmap[byte_start..byte_end];
+
+        // Safety: We assume:
+        // 1. NPY format ensures 8-byte alignment for i64
+        // 2. Platform is little-endian (x86/x86_64) so no byte swap needed
+        // 3. Bounds are checked by caller (start <= end <= len)
+        let ptr = bytes.as_ptr() as *const i64;
+        let len = end - start;
+        std::slice::from_raw_parts(ptr, len)
+    }
+
     /// Get a value at an index.
     pub fn get(&self, idx: usize) -> i64 {
         let start = self.data_offset + idx * 8;

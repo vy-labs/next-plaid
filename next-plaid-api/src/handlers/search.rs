@@ -3,13 +3,14 @@
 //! Handles search operations on indices.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{
     extract::{Path, State},
     Extension, Json,
 };
 use ndarray::Array2;
+use tokio::sync::Semaphore;
 
 use next_plaid::{filtering, SearchParameters};
 
@@ -22,6 +23,25 @@ use crate::models::{
 use crate::state::AppState;
 use crate::tracing_middleware::TraceId;
 use crate::PrettyJson;
+
+/// Limits concurrent search operations to prevent L3 cache thrashing.
+/// Each search creates a ~32MB transposed centroid matrix; too many concurrent
+/// searches cause cache evictions and memory bandwidth saturation, increasing
+/// per-query latency and lowering total throughput.
+///
+/// Configure via env `NEXTPLAID_MAX_CONCURRENT_SEARCHES` (default: 3).
+static SEARCH_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn search_semaphore() -> &'static Semaphore {
+    SEARCH_SEMAPHORE.get_or_init(|| {
+        let max_concurrent = std::env::var("NEXTPLAID_MAX_CONCURRENT_SEARCHES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        tracing::info!(max_concurrent_searches = max_concurrent, "search.concurrency_limit");
+        Semaphore::new(max_concurrent)
+    })
+}
 
 /// Convert query embeddings from JSON format to ndarray.
 fn to_ndarray(query: &QueryEmbeddings) -> ApiResult<Array2<f32>> {
@@ -117,75 +137,103 @@ pub async fn search(
         return Err(ApiError::BadRequest("No queries provided".to_string()));
     }
 
-    // Convert queries to ndarrays
+    // Convert queries to ndarrays (quick, stays on async thread)
     let queries: Vec<Array2<f32>> = req
         .queries
         .iter()
         .map(to_ndarray)
         .collect::<ApiResult<Vec<_>>>()?;
 
-    // Get index (lock-free read - never blocks during writes)
-    let idx = state.get_index_for_read(&name)?;
+    let num_queries = queries.len();
+    let params_req = req.params;
+    let subset = req.subset;
+    let state_clone = Arc::clone(&state);
+    let name_clone = name.clone();
 
-    // Validate query dimensions
-    let expected_dim = idx.embedding_dim();
-    for query in queries.iter() {
-        if query.ncols() != expected_dim {
-            return Err(ApiError::DimensionMismatch {
-                expected: expected_dim,
-                actual: query.ncols(),
-            });
-        }
-    }
+    // Acquire search semaphore — limits concurrent CPU-bound searches to prevent
+    // L3 cache thrashing. Excess requests queue here (non-blocking await) until
+    // a slot opens. This keeps per-query latency low and maximizes total QPS.
+    let _search_permit = search_semaphore()
+        .acquire()
+        .await
+        .map_err(|_| ApiError::Internal("Search semaphore closed".to_string()))?;
 
-    // Build search parameters
-    let top_k = req.params.top_k.unwrap_or(state.config.default_top_k);
-    let params = SearchParameters {
-        top_k,
-        n_ivf_probe: req.params.n_ivf_probe.unwrap_or(8),
-        n_full_scores: req.params.n_full_scores.unwrap_or(4096),
-        batch_size: 2000,
-        // Use provided threshold, or default (None = disabled) if not specified.
-        // The Option<Option<f32>> allows distinguishing "not provided" from "explicitly null".
-        // None (not provided) -> None (disabled), Some(None) (explicit null) -> None, Some(Some(x)) -> Some(x)
-        centroid_score_threshold: req.params.centroid_score_threshold.unwrap_or_default(),
-        ..Default::default()
-    };
+    // Offload ALL blocking work to a thread pool thread:
+    // - Index loading (may block 30s+ on first call while building compact codes)
+    // - Dimension validation
+    // - Search (CPU-bound, 200-400ms)
+    // - Metadata fetch (SQLite I/O)
+    // This keeps the async runtime fully responsive for health checks and new connections.
+    let (results, top_k, total_results, index_query_ms, metadata_fetch_ms) =
+        tokio::task::spawn_blocking(move || {
+            // Get index (lock-free read once loaded, but FIRST call triggers MmapIndex::load
+            // which builds compact codes array — blocks for ~30s on a 1.4B embedding index)
+            let idx = state_clone.get_index_for_read(&name_clone)?;
 
-    // Get path for metadata lookup
-    let path_str = state.index_path(&name).to_string_lossy().to_string();
+            // Validate query dimensions
+            let expected_dim = idx.embedding_dim();
+            for query in queries.iter() {
+                if query.ncols() != expected_dim {
+                    return Err(ApiError::DimensionMismatch {
+                        expected: expected_dim,
+                        actual: query.ncols(),
+                    });
+                }
+            }
 
-    // Perform search and collect raw results
-    let index = &**idx;
-    let index_query_start = std::time::Instant::now();
-    let raw_results: Vec<(usize, Vec<i64>, Vec<f32>)> = if queries.len() == 1 {
-        let result = index.search(&queries[0], &params, req.subset.as_deref())?;
-        vec![(result.query_id, result.passage_ids, result.scores)]
-    } else {
-        let batch_results = index.search_batch(&queries, &params, true, req.subset.as_deref())?;
-        batch_results
-            .into_iter()
-            .map(|r| (r.query_id, r.passage_ids, r.scores))
-            .collect()
-    };
-    let index_query_ms = index_query_start.elapsed().as_millis() as u64;
+            // Build search parameters
+            let top_k = params_req.top_k.unwrap_or(state_clone.config.default_top_k);
+            let params = SearchParameters {
+                top_k,
+                n_ivf_probe: params_req.n_ivf_probe.unwrap_or(8),
+                n_full_scores: params_req.n_full_scores.unwrap_or(4096),
+                batch_size: 2000,
+                centroid_score_threshold: params_req.centroid_score_threshold.unwrap_or_default(),
+                ..Default::default()
+            };
 
-    // Enrich results with metadata
-    let metadata_fetch_start = std::time::Instant::now();
-    let total_results: usize = raw_results.iter().map(|(_, ids, _)| ids.len()).sum();
-    let results: Vec<QueryResultResponse> = raw_results
-        .into_iter()
-        .map(|(query_id, document_ids, scores)| {
-            let metadata = fetch_metadata_for_docs(&path_str, &document_ids)?;
-            Ok(QueryResultResponse {
-                query_id,
-                document_ids,
-                scores,
-                metadata,
-            })
+            let path_str = state_clone.index_path(&name_clone).to_string_lossy().to_string();
+
+            // Clone Arc<MmapIndex> and drop the ArcSwap guard
+            let index = Arc::clone(&*idx);
+            drop(idx);
+
+            // Search
+            let index_query_start = std::time::Instant::now();
+            let raw_results: Vec<(usize, Vec<i64>, Vec<f32>)> = if queries.len() == 1 {
+                let result = index.search(&queries[0], &params, subset.as_deref())?;
+                vec![(result.query_id, result.passage_ids, result.scores)]
+            } else {
+                let batch_results =
+                    index.search_batch(&queries, &params, true, subset.as_deref())?;
+                batch_results
+                    .into_iter()
+                    .map(|r| (r.query_id, r.passage_ids, r.scores))
+                    .collect()
+            };
+            let index_query_ms = index_query_start.elapsed().as_millis() as u64;
+
+            // Metadata fetch
+            let metadata_fetch_start = std::time::Instant::now();
+            let total_results: usize = raw_results.iter().map(|(_, ids, _)| ids.len()).sum();
+            let results: Vec<QueryResultResponse> = raw_results
+                .into_iter()
+                .map(|(query_id, document_ids, scores)| {
+                    let metadata = fetch_metadata_for_docs(&path_str, &document_ids)?;
+                    Ok(QueryResultResponse {
+                        query_id,
+                        document_ids,
+                        scores,
+                        metadata,
+                    })
+                })
+                .collect::<ApiResult<Vec<_>>>()?;
+            let metadata_fetch_ms = metadata_fetch_start.elapsed().as_millis() as u64;
+
+            Ok::<_, ApiError>((results, top_k, total_results, index_query_ms, metadata_fetch_ms))
         })
-        .collect::<ApiResult<Vec<_>>>()?;
-    let metadata_fetch_ms = metadata_fetch_start.elapsed().as_millis() as u64;
+        .await
+        .map_err(|e| ApiError::Internal(format!("Search task panicked: {e}")))??;
 
     let total_ms = start.elapsed().as_millis() as u64;
 
@@ -193,7 +241,7 @@ pub async fn search(
     tracing::info!(
         trace_id = %trace_id,
         index = %name,
-        num_queries = queries.len(),
+        num_queries = num_queries,
         top_k = top_k,
         total_results = total_results,
         index_query_ms = index_query_ms,
@@ -213,7 +261,7 @@ pub async fn search(
     }
 
     Ok(PrettyJson(SearchResponse {
-        num_queries: queries.len(),
+        num_queries,
         results,
     }))
 }
