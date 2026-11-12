@@ -47,6 +47,11 @@ pub struct SearchParameters {
     /// Default: Some(0.4)
     #[serde(default = "default_centroid_score_threshold")]
     pub centroid_score_threshold: Option<f32>,
+    /// Approximate scoring against an 8-bit quantized copy of the query-centroid scores
+    /// (4x less memory traffic per candidate). Only candidate selection for exact
+    /// re-ranking is affected; returned scores are always exact. Default: false.
+    #[serde(default)]
+    pub approx_quantized: bool,
 }
 
 fn default_centroid_batch_size() -> usize {
@@ -66,6 +71,7 @@ impl Default for SearchParameters {
             n_ivf_probe: 8,
             centroid_batch_size: default_centroid_batch_size(),
             centroid_score_threshold: default_centroid_score_threshold(),
+            approx_quantized: false,
         }
     }
 }
@@ -479,6 +485,105 @@ fn approximate_score_transposed(transposed: &[f32], num_tokens: usize, doc_codes
     score
 }
 
+/// Quantize transposed query-centroid scores to u8 with one affine map per query
+/// (`q = round((s - min) * scale)`), so each centroid row is 128 bytes instead of 512.
+/// The map is monotonic, so per-token max selection is preserved up to rounding.
+fn quantize_transposed_u8(transposed: &[f32]) -> (Vec<u8>, f32, f32) {
+    let (min, max) = transposed
+        .par_iter()
+        .fold(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(lo, hi), &s| (lo.min(s), hi.max(s)),
+        )
+        .reduce(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |a, b| (a.0.min(b.0), a.1.max(b.1)),
+        );
+    let scale = if max > min { 255.0 / (max - min) } else { 1.0 };
+    let quantized: Vec<u8> = transposed
+        .par_iter()
+        .map(|&s| ((s - min) * scale).round().clamp(0.0, 255.0) as u8)
+        .collect();
+    (quantized, min, scale)
+}
+
+/// u8 variant of `approximate_score_transposed`: per-token max over the document's codes
+/// (`pmaxub`, 4x the lanes of f32 max), then the token maxima are summed and mapped back
+/// to the f32 score scale. Empty documents score 0, as in the f32 version.
+#[inline]
+fn approximate_score_transposed_u8(
+    transposed: &[u8],
+    num_tokens: usize,
+    doc_codes: &[u32],
+    min: f32,
+    scale: f32,
+) -> f32 {
+    debug_assert!(num_tokens <= 256);
+    if doc_codes.is_empty() {
+        return 0.0;
+    }
+    let mut max_scores = [0u8; 256];
+    let max_buf = &mut max_scores[..num_tokens];
+
+    for (idx, &code) in doc_codes.iter().enumerate() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if idx + 2 < doc_codes.len() {
+                let pf_offset = doc_codes[idx + 2] as usize * num_tokens;
+                if pf_offset + num_tokens <= transposed.len() {
+                    unsafe {
+                        let pf_ptr = transposed.as_ptr().add(pf_offset) as *const i8;
+                        std::arch::x86_64::_mm_prefetch(pf_ptr, std::arch::x86_64::_MM_HINT_T0);
+                        std::arch::x86_64::_mm_prefetch(pf_ptr.add(64), std::arch::x86_64::_MM_HINT_T0);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = idx;
+
+        let offset = code as usize * num_tokens;
+        let row = &transposed[offset..offset + num_tokens];
+        for (m, &s) in max_buf.iter_mut().zip(row.iter()) {
+            *m = (*m).max(s);
+        }
+    }
+
+    let sum: u32 = max_buf.iter().map(|&m| m as u32).sum();
+    sum as f32 / scale + min * num_tokens as f32
+}
+
+/// Approximate MaxSim for every candidate from the transposed query-centroid scores,
+/// either in f32 (exact centroid scores) or against an 8-bit quantized copy.
+fn approximate_scores(
+    index: &crate::index::MmapIndex,
+    candidates: &[i64],
+    transposed: &[f32],
+    num_query_tokens: usize,
+    quantized: bool,
+) -> Vec<(i64, f32)> {
+    if quantized {
+        let (q, min, scale) = quantize_transposed_u8(transposed);
+        candidates
+            .par_iter()
+            .map(|&doc_id| {
+                let codes = index.get_compact_codes(doc_id as usize);
+                let score = approximate_score_transposed_u8(&q, num_query_tokens, codes, min, scale);
+                (doc_id, score)
+            })
+            .collect()
+    } else {
+        candidates
+            .par_iter()
+            .map(|&doc_id| {
+                let codes = index.get_compact_codes(doc_id as usize);
+                let score = approximate_score_transposed(transposed, num_query_tokens, codes);
+                (doc_id, score)
+            })
+            .collect()
+    }
+}
+
 /// Legacy approximate scoring with i64 codes (kept for mmap-only fallback paths).
 #[allow(dead_code)]
 fn approximate_score_mmap(query_centroid_scores: &Array2<f32>, doc_codes: &[i64]) -> f32 {
@@ -638,14 +743,13 @@ pub fn search_one_mmap(
     // Approximate scoring: identical MaxSim computation but cache-friendly.
     // Uses SIMD-friendly slice ops + software prefetching for the transposed layout.
     let t0 = Instant::now();
-    let mut approx_scores: Vec<(i64, f32)> = candidates
-        .par_iter()
-        .map(|&doc_id| {
-            let codes = index.get_compact_codes(doc_id as usize);
-            let score = approximate_score_transposed(&transposed, num_query_tokens, codes);
-            (doc_id, score)
-        })
-        .collect();
+    let mut approx_scores = approximate_scores(
+        index,
+        &candidates,
+        &transposed,
+        num_query_tokens,
+        params.approx_quantized,
+    );
 
     // Partial sort: O(N) selection of top n_full_scores instead of O(N log N) full sort.
     // Only need the top n_full_scores candidates — no need to sort ALL 600K.
@@ -787,16 +891,15 @@ fn search_one_mmap_batched(
     let transposed = transpose_centroid_scores(&query_centroid_scores);
     let transpose_ms = t0.elapsed().as_millis();
 
-    // Step 4: Approximate scoring with transposed layout (identical results, cache-friendly)
+    // Step 4: Approximate scoring with transposed layout (f32, or 8-bit when requested)
     let t0 = Instant::now();
-    let mut approx_scores: Vec<(i64, f32)> = candidates
-        .par_iter()
-        .map(|&doc_id| {
-            let codes = index.get_compact_codes(doc_id as usize);
-            let score = approximate_score_transposed(&transposed, num_query_tokens, codes);
-            (doc_id, score)
-        })
-        .collect();
+    let mut approx_scores = approximate_scores(
+        index,
+        &candidates,
+        &transposed,
+        num_query_tokens,
+        params.approx_quantized,
+    );
 
     // Partial sort: O(N) selection of top n_full_scores instead of O(N log N) full sort.
     let k = params.n_full_scores.min(approx_scores.len());
@@ -934,6 +1037,25 @@ mod tests {
         for (a, b) in got.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-4, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn test_u8_approx_score_close_to_f32() {
+        let num_tokens = 32;
+        let num_centroids = 3_000;
+        // Scores in [-1, 1] like cosine similarities, transposed layout [centroid × token].
+        let scores = pseudo_matrix(num_centroids, num_tokens, 5.0).mapv(|v| v * 2.0 - 1.0);
+        let transposed: Vec<f32> = scores.iter().copied().collect();
+        let (q, min, scale) = quantize_transposed_u8(&transposed);
+        // Worst case error: half a quantization step per token.
+        let tol = num_tokens as f32 * 0.5 / scale + 1e-3;
+        for d in 0..50u32 {
+            let codes: Vec<u32> = (0..40u32).map(|i| (d * 997 + i * 61) % num_centroids as u32).collect();
+            let exact = approximate_score_transposed(&transposed, num_tokens, &codes);
+            let approx = approximate_score_transposed_u8(&q, num_tokens, &codes, min, scale);
+            assert!((exact - approx).abs() <= tol, "doc {d}: {exact} vs {approx} (tol {tol})");
+        }
+        assert_eq!(approximate_score_transposed_u8(&q, num_tokens, &[], min, scale), 0.0);
     }
 
     #[test]

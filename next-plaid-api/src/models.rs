@@ -212,6 +212,12 @@ pub struct SearchParamsRequest {
     #[serde(default)]
     #[schema(example = true)]
     pub include_metadata: Option<bool>,
+    /// Use an 8-bit quantized copy of the query-centroid scores for approximate scoring
+    /// (faster on CPU; only candidate selection changes, returned scores stay exact).
+    /// Default: false.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub approx_quantized: Option<bool>,
 }
 
 /// Single query result.

@@ -190,6 +190,7 @@ pub async fn search(
                 n_full_scores: params_req.n_full_scores.unwrap_or(4096),
                 batch_size: 2000,
                 centroid_score_threshold: params_req.centroid_score_threshold.unwrap_or_default(),
+                approx_quantized: params_req.approx_quantized.unwrap_or(false),
                 ..Default::default()
             };
 
