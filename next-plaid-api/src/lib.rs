@@ -28,7 +28,9 @@ pub struct PrettyJson<T>(pub T);
 
 impl<T: serde::Serialize> axum::response::IntoResponse for PrettyJson<T> {
     fn into_response(self) -> axum::response::Response {
-        match serde_json::to_string_pretty(&self.0) {
+        // Compact output: pretty-printing put every one of up to 20k ids/scores on its own
+        // indented line, multiplying response size and serialize/parse time. Same JSON value.
+        match serde_json::to_string(&self.0) {
             Ok(json) => (
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 json,

@@ -205,6 +205,13 @@ pub struct SearchParamsRequest {
     #[serde(default)]
     #[schema(example = 0.4)]
     pub centroid_score_threshold: Option<Option<f32>>,
+    /// Whether to fetch per-document metadata from SQLite for the results (default: true).
+    /// Set to false when the caller only needs ids and scores: for large top_k the
+    /// metadata fetch and its JSON can cost more than the search itself.
+    /// When false, `metadata` in the response is an empty list.
+    #[serde(default)]
+    #[schema(example = true)]
+    pub include_metadata: Option<bool>,
 }
 
 /// Single query result.

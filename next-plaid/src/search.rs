@@ -5,6 +5,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Instant;
 
 use ndarray::Array1;
+use ndarray::Axis;
 use ndarray::{Array2, ArrayView2};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -256,6 +257,79 @@ fn ivf_probe_batched(
         });
     }
 
+    selected.into_iter().collect()
+}
+
+/// Largest full query×centroid score matrix (bytes) that the batched search computes once
+/// and reuses for both IVF probing and approximate scoring. 128 tokens × 131,072 centroids
+/// is 64 MiB; above this limit the memory-bounded batched probe is used instead.
+const FULL_CENTROID_SCORES_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+/// Centroid columns per parallel GEMM block when computing query×centroid scores.
+const CENTROID_GEMM_CHUNK: usize = 8192;
+
+/// Compute the full [num_tokens × num_centroids] query-centroid score matrix with the
+/// centroid axis split across rayon threads (a single `dot` runs on one core).
+fn query_centroid_scores_parallel(query: &Array2<f32>, centroids: &CentroidStore) -> Array2<f32> {
+    let num_centroids = centroids.nrows();
+    let mut out = Array2::<f32>::zeros((query.nrows(), num_centroids));
+    out.axis_chunks_iter_mut(Axis(1), CENTROID_GEMM_CHUNK)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut block)| {
+            let start = i * CENTROID_GEMM_CHUNK;
+            let end = (start + CENTROID_GEMM_CHUNK).min(num_centroids);
+            let chunk = centroids.slice_rows(start, end);
+            ndarray::linalg::general_mat_mul(1.0, query, &chunk.t(), 0.0, &mut block);
+        });
+    out
+}
+
+/// IVF probing from a precomputed [num_tokens × num_centroids] score matrix.
+///
+/// Same selection as `ivf_probe_batched` (union of each token's top `n_probe` centroids),
+/// with the per-token selection run in parallel and no second GEMM. The optional
+/// threshold keeps a centroid only if its max score over all query tokens reaches it.
+fn ivf_probe_from_scores(
+    scores: &Array2<f32>,
+    n_probe: usize,
+    centroid_score_threshold: Option<f32>,
+) -> Vec<usize> {
+    let num_centroids = scores.ncols();
+    let n_probe = n_probe.min(num_centroids);
+    if n_probe == 0 {
+        return Vec::new();
+    }
+
+    let per_token: Vec<Vec<usize>> = (0..scores.nrows())
+        .into_par_iter()
+        .map(|q| {
+            let mut ranked: Vec<(f32, u32)> = scores
+                .row(q)
+                .iter()
+                .enumerate()
+                .map(|(c, &s)| (s, c as u32))
+                .collect();
+            if ranked.len() > n_probe {
+                ranked.select_nth_unstable_by(n_probe - 1, |a, b| {
+                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                ranked.truncate(n_probe);
+            }
+            ranked.into_iter().map(|(_, c)| c as usize).collect()
+        })
+        .collect();
+
+    let mut selected: HashSet<usize> = per_token.into_iter().flatten().collect();
+    if let Some(threshold) = centroid_score_threshold {
+        selected.retain(|&c| {
+            scores
+                .column(c)
+                .iter()
+                .fold(f32::NEG_INFINITY, |m, &s| m.max(s))
+                >= threshold
+        });
+    }
     selected.into_iter().collect()
 }
 
@@ -664,15 +738,25 @@ fn search_one_mmap_batched(
     let t_total = Instant::now();
     let _num_query_tokens = query.nrows();
 
-    // Step 1: Batched IVF probing
+    // Step 1: IVF probing. When the full query×centroid matrix is small enough, compute it
+    // once (parallel GEMM) and reuse it for approximate scoring in step 3; otherwise fall
+    // back to the memory-bounded batched probe and compute the matrix again in step 3.
     let t0 = Instant::now();
-    let cells_to_probe = ivf_probe_batched(
-        query,
-        &index.codec.centroids,
-        params.n_ivf_probe,
-        params.centroid_batch_size,
-        params.centroid_score_threshold,
-    );
+    let full_scores_bytes = query.nrows() * index.codec.centroids.nrows() * std::mem::size_of::<f32>();
+    let (cells_to_probe, precomputed_scores) = if full_scores_bytes <= FULL_CENTROID_SCORES_MAX_BYTES {
+        let scores = query_centroid_scores_parallel(query, &index.codec.centroids);
+        let cells = ivf_probe_from_scores(&scores, params.n_ivf_probe, params.centroid_score_threshold);
+        (cells, Some(scores))
+    } else {
+        let cells = ivf_probe_batched(
+            query,
+            &index.codec.centroids,
+            params.n_ivf_probe,
+            params.centroid_batch_size,
+            params.centroid_score_threshold,
+        );
+        (cells, None)
+    };
 
     // Step 2: Get candidate documents from IVF
     let mut candidates = index.get_candidates(&cells_to_probe);
@@ -696,7 +780,10 @@ fn search_one_mmap_batched(
     // Step 3: Build centroid scores and transpose for cache-friendly access
     let num_query_tokens = query.nrows();
     let t0 = Instant::now();
-    let query_centroid_scores = query.dot(&index.codec.centroids.view().t());
+    let query_centroid_scores = match precomputed_scores {
+        Some(scores) => scores,
+        None => query.dot(&index.codec.centroids.view().t()),
+    };
     let transposed = transpose_centroid_scores(&query_centroid_scores);
     let transpose_ms = t0.elapsed().as_millis();
 
@@ -828,6 +915,41 @@ pub type SearchResult = QueryResult;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic pseudo-random matrix (no RNG dependency in tests).
+    fn pseudo_matrix(rows: usize, cols: usize, seed: f32) -> Array2<f32> {
+        Array2::from_shape_fn((rows, cols), |(r, c)| {
+            ((r as f32 * 12.9898 + c as f32 * 78.233 + seed).sin() * 43758.547).fract()
+        })
+    }
+
+    #[test]
+    fn test_parallel_centroid_scores_match_dot() {
+        let query = pseudo_matrix(32, 16, 1.0);
+        let centroids = pseudo_matrix(20_000, 16, 2.0);
+        let expected = query.dot(&centroids.t());
+        let store = CentroidStore::Owned(centroids);
+        let got = query_centroid_scores_parallel(&query, &store);
+        assert_eq!(got.dim(), expected.dim());
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn test_probe_from_scores_matches_batched_probe() {
+        let query = pseudo_matrix(32, 16, 3.0);
+        let centroids = pseudo_matrix(5_000, 16, 4.0);
+        let store = CentroidStore::Owned(centroids);
+        let scores = query_centroid_scores_parallel(&query, &store);
+        for threshold in [None, Some(0.5f32)] {
+            let mut batched = ivf_probe_batched(&query, &store, 8, 700, threshold);
+            let mut direct = ivf_probe_from_scores(&scores, 8, threshold);
+            batched.sort_unstable();
+            direct.sort_unstable();
+            assert_eq!(batched, direct, "threshold {threshold:?}");
+        }
+    }
 
     #[test]
     fn test_colbert_score() {
