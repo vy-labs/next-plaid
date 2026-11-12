@@ -146,6 +146,7 @@ pub async fn search(
 
     let num_queries = queries.len();
     let params_req = req.params;
+    let include_metadata = params_req.include_metadata.unwrap_or(true);
     let subset = req.subset;
     let state_clone = Arc::clone(&state);
     let name_clone = name.clone();
@@ -189,6 +190,7 @@ pub async fn search(
                 n_full_scores: params_req.n_full_scores.unwrap_or(4096),
                 batch_size: 2000,
                 centroid_score_threshold: params_req.centroid_score_threshold.unwrap_or_default(),
+                approx_quantized: params_req.approx_quantized.unwrap_or(false),
                 ..Default::default()
             };
 
@@ -219,7 +221,11 @@ pub async fn search(
             let results: Vec<QueryResultResponse> = raw_results
                 .into_iter()
                 .map(|(query_id, document_ids, scores)| {
-                    let metadata = fetch_metadata_for_docs(&path_str, &document_ids)?;
+                    let metadata = if include_metadata {
+                        fetch_metadata_for_docs(&path_str, &document_ids)?
+                    } else {
+                        Vec::new()
+                    };
                     Ok(QueryResultResponse {
                         query_id,
                         document_ids,
